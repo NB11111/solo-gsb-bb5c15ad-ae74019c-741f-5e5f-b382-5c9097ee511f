@@ -11,6 +11,7 @@ from app.solver import (  # noqa: E402
     TargetUnreachableError,
     Ware,
     append_items,
+    cancel_items_and_repack,
     compare_kiln_assignments,
     min_capacity_for_target,
     select_within_kiln_limit,
@@ -777,6 +778,258 @@ def test_append_items_random_brute_force():
             f"original={original_kilns}, new={new_items}, cap={capacity}"
         )
         _check_append_result(kilns, original_kilns, new_items, capacity)
+
+
+# ---------------------------------------------------------------------------
+# 取消器物 cancel_items_and_repack
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_cancel(items, capacity, original_kilns, cancel_ids):
+    """枚举剩余器物的全部 K 窑划分，K 为最少窑次，返回
+    (最少窑次, 最大留窑数, 最优方案元组)，次目标并列取整体字典序最小，
+    配对并列沿用 compare_kiln_assignments 的配对字典序规则。"""
+    by_id = {it.item_id: it for it in items}
+    cancel = set(cancel_ids)
+    rem = sorted(i for i in by_id if i not in cancel)
+    rem_wares = [by_id[i] for i in rem]
+    min_k = len(solve(rem_wares, capacity))
+    best = None  # (-留窑数, 方案元组)
+
+    def fits(members):
+        vol = sum(by_id[i].volume for i in members)
+        lo = max(by_id[i].temp_low for i in members)
+        hi = min(by_id[i].temp_high for i in members)
+        return vol <= capacity and lo <= hi
+
+    def rec(s, groups):
+        nonlocal best
+        if not s:
+            if len(groups) != min_k:
+                return
+            plan = tuple(sorted(tuple(sorted(g)) for g in groups))
+            # 与接口相同：完整原窑列表（含被腾空的窑）做一对一最优配对
+            stayed = len(
+                compare_kiln_assignments(original_kilns, list(plan)).stayed_item_ids
+            )
+            key = (-stayed, plan)
+            if best is None or key < best[0]:
+                best = (key, stayed)
+            return
+
+        elem = s[0]
+        rest = s[1:]
+        for gi in range(len(groups)):
+            ng = groups[gi] | {elem}
+            if fits(ng):
+                rec(rest, groups[:gi] + [ng] + groups[gi + 1:])
+        if fits({elem}):
+            rec(rest, groups + [{elem}])
+
+    rec(rem, [])
+    assert best is not None
+    return min_k, best[1], best[0][1]
+
+
+def _check_cancel_result(result, items, capacity, original_kilns, cancel_ids):
+    """校验取消重排结果的基本性质。"""
+    by_id = {it.item_id: it for it in items}
+    cancel = set(cancel_ids)
+    remaining = sorted(i for i in by_id if i not in cancel)
+
+    # 划分完备：新窑恰覆盖全部剩余器物，各窑可行且窑内编号升序
+    grouped = [x for k in result.kilns for x in k.item_ids]
+    assert sorted(grouped) == remaining
+    assert len(grouped) == len(set(grouped))
+    for k in result.kilns:
+        assert list(k.item_ids) == sorted(k.item_ids)
+        assert k.total_volume == sum(by_id[i].volume for i in k.item_ids)
+        assert k.total_volume <= capacity
+        assert k.firing_temp == max(by_id[i].temp_low for i in k.item_ids)
+        assert k.firing_temp <= min(by_id[i].temp_high for i in k.item_ids)
+
+    # 取消编号升序；留窑 + 换窑恰好划分剩余器物
+    assert list(result.canceled_item_ids) == sorted(result.canceled_item_ids)
+    assert set(result.canceled_item_ids) == cancel
+    assert set(result.stayed_item_ids).isdisjoint(result.moved_item_ids)
+    assert set(result.stayed_item_ids) | set(result.moved_item_ids) == set(remaining)
+    assert result.max_stayed_count == len(result.stayed_item_ids)
+
+    # 对外配对与留窑 / 换窑编号必须与 compare 规则完全一致
+    cmp = compare_kiln_assignments(
+        original_kilns, [list(k.item_ids) for k in result.kilns]
+    )
+    assert result.pairs == cmp.pairs
+    assert result.stayed_item_ids == cmp.stayed_item_ids
+    assert result.moved_item_ids == cmp.moved_item_ids
+
+
+def test_cancel_items_no_reschedule_needed():
+    # 原方案 3 窑，取消后每件仍单独成窑：最优配对为恒等配对，全部留窑。
+    items = [Ware(str(i), 6, 100, 200) for i in range(1, 4)]
+    original = [["1"], ["2"], ["3"]]
+    result = cancel_items_and_repack(items, 10, original, ["2"])
+    assert [k.item_ids for k in result.kilns] == [("1",), ("3",)]
+    assert result.canceled_item_ids == ("2",)
+    assert result.stayed_item_ids == ("1", "3")
+    assert result.moved_item_ids == ()
+    assert result.pairs == ((1, 1), (3, 2))
+    _check_cancel_result(result, items, 10, original, ["2"])
+
+
+def test_cancel_items_compact_fewer_kilns():
+    # 原方案 [p1] [p2,p3] [p4](高温)；取消 p4 后 p1/p2/p3 可在容量 15 下
+    # 一窑烧成，最少窑次从 3 降为 1；与原窑配对取共同器物最多者 (2,1)。
+    items = [
+        Ware("p1", 5, 100, 200),
+        Ware("p2", 6, 120, 220),
+        Ware("p3", 4, 150, 300),
+        Ware("p4", 5, 1000, 1100),
+    ]
+    original = [["p1"], ["p2", "p3"], ["p4"]]
+    result = cancel_items_and_repack(items, 15, original, ["p4"])
+    assert len(result.kilns) == 1
+    assert result.kilns[0].item_ids == ("p1", "p2", "p3")
+    assert result.kilns[0].total_volume == 15
+    assert result.kilns[0].firing_temp == 150
+    # 新窑含 p2,p3，与原窑 2 配对留窑 2 件，优于与原窑 1 配对的 1 件
+    assert result.pairs == ((2, 1),)
+    assert result.stayed_item_ids == ("p2", "p3")
+    assert result.moved_item_ids == ("p1",)
+    _check_cancel_result(result, items, 15, original, ["p4"])
+
+
+def test_cancel_items_stayed_beats_lex_within_min_kilns():
+    # 容量 6：原方案 [a,b] [c,d]（各 6）。取消后剩余 3 件最少需 2 窑：
+    # 拆法 (a)(b,c,d) 不可行（体积 9 > 6），可行拆法中
+    # (a,b)(c,d去掉?)… 构造为原窑 [a,b][c,d]，取消 d -> 剩 a,b,c，
+    # 可行 2 窑划分：(a,b)(c) 留窑 3，(a)(b,c) 与 (a,c)(b) 各留窑 1。
+    items = [
+        Ware("a", 3, 100, 200),
+        Ware("b", 3, 100, 200),
+        Ware("c", 3, 100, 200),
+        Ware("d", 3, 100, 200),
+    ]
+    original = [["a", "b"], ["c", "d"]]
+    result = cancel_items_and_repack(items, 6, original, ["d"])
+    assert len(result.kilns) == 2
+    # 整体字典序更小的 (a)(b,c) 只留 1 件，须让位于留窑 3 件的 (a,b)(c)
+    assert [k.item_ids for k in result.kilns] == [("a", "b"), ("c",)]
+    assert result.max_stayed_count == 3
+    assert result.stayed_item_ids == ("a", "b", "c")
+    assert result.moved_item_ids == ()
+    assert result.pairs == ((1, 1), (2, 2))
+    _check_cancel_result(result, items, 6, original, ["d"])
+
+
+def test_cancel_items_pairing_lex_tiebreak():
+    # 构造「最大留窑数相同、最优配对不唯一」的并列：
+    # 原方案 [a] [b] [c]（容量 3，每件 3，温度全兼容），取消 z 后…
+    # 直接取 3 件器物取消其中 0 件不允许，故用 4 件取消 1：
+    # 原方案（容量 3）[a] [b] [c] [d]，取消 d 后剩 a,b,c 仍需 3 窑（单件），
+    # 无并列。改容量 6：原 [a,b] [c] [d]，取消 d 后剩 a,b,c，最少 2 窑，
+    # 可行划分 (a,b)(c) 与 (a)(b,c)：
+    #   方案 (a,b)(c)：配对 (1,1)(2,2) 留窑 3；
+    #   方案 (a)(b,c)：配对 (1,1)(2,2) 留窑 1（(2,1)(3,2) 也是 1）。
+    # 留窑数不同，无并列。真正并列需要各窑器物错配后仍同分：
+    items = [
+        Ware("a", 3, 100, 200),
+        Ware("b", 3, 100, 200),
+        Ware("c", 3, 100, 200),
+    ]
+    # 容量 6 原方案 [a] [b,c]，取消后剩 a,b（取消 c）：
+    # 最少 1 窑 (a,b)，与原窑 1/2 配对均留窑 1，配对并列取
+    # 字典序最小 (1,1)，故 a 留窑、b 换窑。
+    original = [["a"], ["b", "c"]]
+    result = cancel_items_and_repack(items, 6, original, ["c"])
+    assert len(result.kilns) == 1
+    assert result.kilns[0].item_ids == ("a", "b")
+    assert result.max_stayed_count == 1
+    assert result.pairs == ((1, 1),)
+    assert result.stayed_item_ids == ("a",)
+    assert result.moved_item_ids == ("b",)
+    _check_cancel_result(result, items, 6, original, ["c"])
+
+
+def test_cancel_items_empty_original_kiln_counts_unpaired():
+    # 取消某窑的全部器物后该窑被腾空：腾空窑不参与配对，原在其中者不存在，
+    # 其余器物若换窑仍按规则统计。
+    items = [
+        Ware("h", 5, 1000, 1100),
+        Ware("x", 6, 100, 200),
+        Ware("y", 6, 100, 200),
+    ]
+    original = [["h"], ["x"], ["y"]]
+    result = cancel_items_and_repack(items, 10, original, ["h"])
+    assert len(result.kilns) == 2
+    assert [k.item_ids for k in result.kilns] == [("x",), ("y",)]
+    # 原窑 1 腾空；剩 2 窑与新窑配 2 对，字典序最小为 (2,1)(3,2)
+    assert result.pairs == ((2, 1), (3, 2))
+    assert result.stayed_item_ids == ("x", "y")
+    assert result.moved_item_ids == ()
+    _check_cancel_result(result, items, 10, original, ["h"])
+
+
+def test_cancel_items_invalid():
+    items = [Ware("a", 1, 100, 200), Ware("b", 1, 100, 200)]
+    original = [["a"], ["b"]]
+    for bad in ([], ["a", "a"], ["z"], ["a", "b"]):
+        try:
+            cancel_items_and_repack(items, 10, original, bad)
+            assert False, f"{bad}: 应抛出 ValueError"
+        except ValueError:
+            pass
+
+
+def test_cancel_items_random_brute_force():
+    # 随机小规模用例：最少窑次、最大留窑数、整体字典序方案全部交叉验证
+    rng = random.Random(31337)
+    for trial in range(400):
+        n = rng.randint(2, 7)
+        items = []
+        for i in range(n):
+            vol = rng.randint(1, 7)
+            lo = rng.randint(100, 140)
+            hi = lo + rng.randint(0, 40)
+            items.append(Ware(f"i{i}", vol, lo, hi))
+        capacity = rng.randint(max(it.volume for it in items), 18)
+        original = [list(k.item_ids) for k in solve(items, capacity)]
+        cancel = rng.sample(
+            sorted(it.item_id for it in items), rng.randint(1, n - 1)
+        )
+
+        result = cancel_items_and_repack(items, capacity, original, cancel)
+        exp_k, exp_stayed, exp_plan = _brute_force_cancel(
+            items, capacity, original, cancel
+        )
+        got_plan = tuple(k.item_ids for k in result.kilns)
+        assert len(result.kilns) == exp_k, (
+            f"trial {trial}: kilns {len(result.kilns)} != {exp_k}"
+        )
+        assert result.max_stayed_count == exp_stayed, (
+            f"trial {trial}: stayed {result.max_stayed_count} != {exp_stayed}, "
+            f"items={items}, cap={capacity}, cancel={cancel}, "
+            f"original={original}, got={got_plan}"
+        )
+        assert got_plan == exp_plan, (
+            f"trial {trial}: {got_plan} != {exp_plan}, "
+            f"items={items}, cap={capacity}, cancel={cancel}, original={original}"
+        )
+        _check_cancel_result(result, items, capacity, original, cancel)
+
+
+def test_cancel_items_performance_n14():
+    # 取消 1 件、容量 4（剩余 13 件最少 4 窑）的较紧场景，控制在数秒内
+    import time
+
+    items = [Ware(f"i{i:02d}", 1, 100, 200) for i in range(14)]
+    original = [list(k.item_ids) for k in solve(items, 4)]
+    t0 = time.time()
+    result = cancel_items_and_repack(items, 4, original, ["i00"])
+    elapsed = time.time() - t0
+    assert elapsed < 10.0, f"取消重排耗时 {elapsed:.2f}s"
+    assert len(result.kilns) == 4
+    assert result.max_stayed_count == 13
 
 
 if __name__ == "__main__":

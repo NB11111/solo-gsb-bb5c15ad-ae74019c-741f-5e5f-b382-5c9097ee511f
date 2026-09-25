@@ -75,6 +75,38 @@ class AppendItemsIn(BaseModel):
         return self
 
 
+class CancelItemsIn(BaseModel):
+    """取消器物请求。"""
+
+    item_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="待取消器物编号（非空、不重复，均须属于原方案；取消后至少保留一件）",
+    )
+
+    @field_validator("item_ids")
+    @classmethod
+    def _strip_each(cls, values: list[str]) -> list[str]:
+        cleaned = [v.strip() for v in values]
+        blank = [v for v in cleaned if not v]
+        if blank:
+            raise ValueError("器物编号不得为空字符串")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _unique_ids(self):
+        seen: set[str] = set()
+        dup: list[str] = []
+        for item_id in self.item_ids:
+            if item_id in seen and item_id not in dup:
+                dup.append(item_id)
+            seen.add(item_id)
+        if dup:
+            raise ValueError(f"器物编号不得重复，重复编号: {', '.join(dup)}")
+        return self
+
+
 class ItemOut(ItemIn):
     pass
 
@@ -181,3 +213,26 @@ class PlanCompareOut(BaseModel):
     only_in_target_item_ids: list[str] = Field(
         ..., description="仅出现在目标方案的器物编号，按编号升序"
     )
+
+
+class CancelItemsOut(BaseModel):
+    """取消器物并重排的结果（另存为新方案，不改写原方案）。"""
+
+    source_plan_id: str = Field(..., description="原方案 ID")
+    new_plan_id: str = Field(..., description="重排后另存的新方案 ID")
+    canceled_item_ids: list[str] = Field(
+        ..., description="已取消的器物编号，按编号升序"
+    )
+    canceled_count: int = Field(..., description="取消器物数")
+    stayed_item_ids: list[str] = Field(
+        ..., description="留窑（仍在配对后的对应窑）器物编号，按编号升序"
+    )
+    moved_item_ids: list[str] = Field(
+        ..., description="换窑器物编号（含所在原窑被腾空者），按编号升序"
+    )
+    stayed_count: int = Field(..., description="留窑器物数（次目标的最优值）")
+    moved_count: int = Field(..., description="换窑器物数")
+    kiln_pairs: list[KilnPairOut] = Field(
+        ..., description="原窑次与新窑次的一对一配对，按原窑次序号升序"
+    )
+    new_plan: PlanOut = Field(..., description="重排后另存的新方案完整内容")

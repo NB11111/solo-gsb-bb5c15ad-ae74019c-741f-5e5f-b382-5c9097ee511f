@@ -30,6 +30,15 @@
 与温度区间交集均满足的原窑（同一原窑可填多件，按合并整体判定），或进入
 追加窑次。以后缀位掩码 DP 求新增窑次最少的全局方案，再按原窑次序贪心
 重建整体字典序最小者；剩余新器物的追加窑次复用 solve。
+
+取消器物（cancel_items_and_repack）：沿用原方案容量与剩余器物温区重新紧凑
+排程。先由 solve 的子集表与 dp 取剩余器物的最少窑次；再在所有最少窑次方案
+中，以「新旧窑次一对一最优配对后仍留在对应窑的器物数最多」为次目标
+（配对即 compare_kiln_assignments 的二分图最大权匹配，并列沿用其配对
+字典序规则），最后按整体字典序定序。求解用「旧窑标签 × 器物子集」
+位掩码 DP：按原窑次序逐标签决定其与哪一新窑配对（或不配），新窑即剩余
+器物的一个可行非空子集，状态值为 (已留窑数, 已选新窑的规范化排名集合)，
+同一状态取留窑数更大、并列时窑序列字典序更小者。
 """
 
 from __future__ import annotations
@@ -88,6 +97,23 @@ class PlanComparison:
 
 
 @dataclass(frozen=True)
+class CancelItemsResult:
+    """取消器物后的紧凑重排结果。
+
+    kilns 为新方案各窑（窑内编号升序，窑次按整体字典序规则定序）；
+    pairs 为（原窑序号, 新窑序号）配对，按原窑序号升序；
+    stayed / moved 针对取消后仍保留的器物，分别表示留窑 / 换窑编号。
+    """
+
+    canceled_item_ids: tuple[str, ...]
+    stayed_item_ids: tuple[str, ...]
+    moved_item_ids: tuple[str, ...]
+    pairs: tuple[tuple[int, int], ...]
+    kilns: tuple[Kiln, ...]
+    max_stayed_count: int
+
+
+@dataclass(frozen=True)
 class _Tables:
     """子集枚举与位掩码 DP 的中间结果（位 i 对应编号升序后的第 i 件）。"""
 
@@ -97,7 +123,6 @@ class _Tables:
     mask_temp_low: list[int]  # 交集下界（烧成温度）
     valid: bytearray
     dp: list[int]
-
 
 def _check_item_count(n: int) -> None:
     if n == 0:
@@ -665,3 +690,210 @@ def append_items(
         )
 
     return kilns
+
+
+def cancel_items_and_repack(
+    items: Sequence[Ware],
+    capacity: int,
+    original_kiln_ids: Sequence[Sequence[str]],
+    cancel_ids: Sequence[str],
+) -> CancelItemsResult:
+    """取消器物后的紧凑重排（另存新方案，原方案不动）。
+
+    沿用原方案的单窑容量与剩余器物的体积 / 温区重新排程，优先级：
+      1. **新方案窑次最少**（solve 子集表与 dp 给出的最少窑次 K）；
+      2. 同为 K 窑时，把原窑（取消器物后可能变空）与新窑一对一配对
+         （配对数 K，配对规则与 compare_kiln_assignments 完全一致：
+         留窑数最大，并列取配对序列字典序最小），使**留在对应窑的器物数
+         最多**；
+      3. 仍并列时取新窑编号升序列表的**整体字典序最小**方案。
+
+    求「最少窑次约束下的最大留窑数」用「原窑标签 × 器物子集」位掩码 DP：
+    按原窑次序逐个标签决定跳过或与一个新窑（剩余器物的可行非空子集）配对，
+    状态 (j, p, mask) 表示原窑 j..r-1（仅含有剩余器物的原窑 r 个）尚待处理、
+    还需配出 p 个新窑、已安置器物集合 mask；状态值同时携带已选新窑的规范化
+    排名集合，使同一 (留窑数, 窑序列字典序) 择优可直接编码为整数取最大。
+    重建得到最优新窑划分后，再调用 compare_kiln_assignments 生成对外的
+    配对与留窑 / 换窑编号，保证并列配对沿用现有方案对比规则。
+
+    :param items: 原方案的全部器物
+    :param capacity: 原方案的单窑容量
+    :param original_kiln_ids: 原方案各窑器物编号（按原窑次序）
+    :param cancel_ids: 待取消编号（非空、不重复、均属原方案，且不可取消全部）
+    :raises ValueError: 取消列表为空 / 有重复 / 含不属于原方案的编号 /
+        取消后无剩余器物。
+    """
+
+    cancel_set = set(cancel_ids)
+    if not cancel_set:
+        raise ValueError("取消器物编号列表不能为空")
+    if len(cancel_set) != len(list(cancel_ids)):
+        raise ValueError("取消器物编号不得重复")
+    by_id = {it.item_id: it for it in items}
+    unknown = sorted(cancel_set - set(by_id))
+    if unknown:
+        raise ValueError("以下器物编号不属于原方案: " + ", ".join(unknown))
+
+    remaining = [it for it in items if it.item_id not in cancel_set]
+    if not remaining:
+        raise ValueError("取消后至少需要保留一件器物")
+
+    # ---- 1. 剩余器物的子集表与最少窑次 ----
+    tables = _build_tables(remaining, capacity)
+    n = tables.n
+    ids = tables.ids
+    valid = tables.valid
+    dp = tables.dp
+    mask_volume = tables.mask_volume
+    mask_temp_low = tables.mask_temp_low
+    size = 1 << n
+    full = size - 1
+    min_kilns = dp[full]
+
+    # ---- 2. 仅保留取消后仍含器物的原窑作为「标签」 ----
+    id_bit = {item_id: i for i, item_id in enumerate(ids)}
+    label_masks: list[int] = []  # 各标签对应原窑在剩余器物上的位掩码
+    for kiln_ids in original_kiln_ids:
+        lm = 0
+        for item_id in kiln_ids:
+            if item_id in id_bit:
+                lm |= 1 << id_bit[item_id]
+        if lm:
+            label_masks.append(lm)
+    r = len(label_masks)
+    assert min_kilns <= r  # 原方案本身就是剩余器物的一个 ≤ r 窑可行装窑
+
+    # ---- 3. 可行新窑子集的规范化排名（按窑内编号升序列表字典序） ----
+    feasible_masks = [g for g in range(1, size) if valid[g]]
+    feasible_masks.sort(
+        key=lambda g: tuple(ids[i] for i in range(n) if (g >> i) & 1)
+    )
+    f_count = len(feasible_masks)
+    rank_of = {g: rank for rank, g in enumerate(feasible_masks)}
+
+    # feas_subs[u]：u 的全部可行非空子集
+    feas_subs: list[list[int]] = [[] for _ in range(size)]
+    for mask in range(1, size):
+        subs = feas_subs[mask]
+        sub = mask
+        while sub:
+            if valid[sub]:
+                subs.append(sub)
+            sub = (sub - 1) & mask
+
+    # ---- 4. 标签 DP：编码 (留窑数 << f_count | 已选窑排名位集)，取整数最大 ----
+    # 整数高位先比留窑数；留窑数相同时，排名位集用反转位（排名越小、位越高），
+    # 故位集数值越大 ⇔ 按排名升序排列的窑序列字典序越小（等长位集对称差中
+    # 的最高位属于谁，谁的最小不同窑排名就更小）。整数取最大即
+    # 「留窑数最多 → 整体字典序最小」。
+    shift = f_count
+    memo: dict[tuple[int, int, int], int] = {}
+
+    def _rank_bit(rank: int) -> int:
+        return 1 << (f_count - 1 - rank)
+
+    def best(j: int, p: int, mask: int) -> int:
+        """返回状态最优编码；不可行为 -1。"""
+        key = (j, p, mask)
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+
+        unassigned = full ^ mask
+        need = dp[unassigned]
+        # 剩余器物最少需 need 窑、至多占用剩余标签数；任一不满足即不可行。
+        if need > p or p > r - j:
+            memo[key] = -1
+            return -1
+        if j == r:
+            result = 0 if p == 0 and unassigned == 0 else -1
+            memo[key] = result
+            return result
+
+        # 标签 j 不与任何新窑配对
+        value = best(j + 1, p, mask)
+
+        # 标签 j 与新窑 g 配对：g 为未安置器物的可行非空子集，
+        # 取出后剩余器物仍能在 p-1 窑内装完。
+        if p >= 1:
+            lm = label_masks[j]
+            for g in feas_subs[unassigned]:
+                if dp[unassigned ^ g] <= p - 1:
+                    child = best(j + 1, p - 1, mask | g)
+                    if child >= 0:
+                        gain = (g & lm).bit_count()
+                        candidate = child + (gain << shift) + _rank_bit(rank_of[g])
+                        if candidate > value:
+                            value = candidate
+
+        memo[key] = value
+        return value
+
+    root = best(0, min_kilns, 0)
+    assert root >= 0
+    max_stayed = root >> shift
+
+    # ---- 5. 重建：逐标签找出构成最优编码的动作 ----
+    chosen: dict[int, int] = {}  # 标签序号 -> 新窑位掩码
+    j, p, mask = 0, min_kilns, 0
+    while j < r:
+        cur = best(j, p, mask)
+        if best(j + 1, p, mask) == cur:
+            j += 1
+            continue
+        unassigned = full ^ mask
+        picked = 0
+        for g in feasible_masks:  # 排名升序枚举，便于确定性重建
+            if (g & ~unassigned) or not valid[g]:
+                continue
+            if dp[unassigned ^ g] > p - 1:
+                continue
+            child = best(j + 1, p - 1, mask | g)
+            if child < 0:
+                continue
+            candidate = (
+                child
+                + ((g & label_masks[j]).bit_count() << shift)
+                + _rank_bit(rank_of[g])
+            )
+            if candidate == cur:
+                picked = g
+                break
+        assert picked
+        chosen[j] = picked
+        mask |= picked
+        p -= 1
+        j += 1
+
+    # 选中窑按规范化排名升序即整体字典序最小的窑次序。
+    selected = sorted(chosen.values(), key=lambda g: rank_of[g])
+    assert len(selected) == min_kilns
+
+    def _members(g: int) -> tuple[str, ...]:
+        return tuple(ids[i] for i in range(n) if (g >> i) & 1)
+
+    kilns = tuple(
+        Kiln(
+            item_ids=_members(g),
+            total_volume=mask_volume[g],
+            firing_temp=mask_temp_low[g],
+        )
+        for g in selected
+    )
+
+    # ---- 6. 对外配对与留窑 / 换窑编号复用 compare（并列沿用对比规则） ----
+    comparison = compare_kiln_assignments(
+        [list(kiln_ids) for kiln_ids in original_kiln_ids],
+        [list(k.item_ids) for k in kilns],
+    )
+    # compare 的最大留窑数必须与标签 DP 求出的最优值一致。
+    assert len(comparison.stayed_item_ids) == max_stayed
+
+    return CancelItemsResult(
+        canceled_item_ids=tuple(sorted(cancel_set)),
+        stayed_item_ids=comparison.stayed_item_ids,
+        moved_item_ids=comparison.moved_item_ids,
+        pairs=comparison.pairs,
+        kilns=kilns,
+        max_stayed_count=max_stayed,
+    )

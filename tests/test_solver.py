@@ -11,6 +11,7 @@ from app.solver import (  # noqa: E402
     TargetUnreachableError,
     Ware,
     append_items,
+    cancel_items,
     compare_kiln_assignments,
     min_capacity_for_target,
     select_within_kiln_limit,
@@ -777,6 +778,255 @@ def test_append_items_random_brute_force():
             f"original={original_kilns}, new={new_items}, cap={capacity}"
         )
         _check_append_result(kilns, original_kilns, new_items, capacity)
+
+
+# ---------------------------------------------------------------------------
+# 取消器物 cancel_items
+# ---------------------------------------------------------------------------
+
+
+def _brute_force_cancel(original_kilns, cancel_ids, capacity):
+    """暴力枚举取消后剩余器物的全部最少窑次方案，返回
+    (方案键, 最优配对留窑数, 最优配对序列)。
+
+    排序优先级与接口一致：窑次最少 → 最优配对留窑数最多 → 整体字典序最小；
+    配对并列时配对序列字典序规则复用 compare_kiln_assignments。
+    """
+    canceled = set(cancel_ids)
+    by_id = {
+        w.item_id: w
+        for kiln in original_kilns
+        for w in kiln
+        if w.item_id not in canceled
+    }
+    ids = sorted(by_id)
+    min_k, _ = _brute_force(list(by_id.values()), capacity)
+
+    old_kiln_ids = [
+        tuple(sorted(w.item_id for w in kiln if w.item_id not in canceled))
+        for kiln in original_kilns
+    ]
+    nonempty_index = [
+        idx + 1
+        for idx, group in enumerate(old_kiln_ids)
+        if group
+    ]
+    old_kiln_ids = [g for g in old_kiln_ids if g]
+
+    best = None  # (窑次, -留窑数, 方案键, 配对)
+    found = []
+
+    def gen(remaining, groups):
+        if not remaining:
+            plan = tuple(sorted(tuple(sorted(g)) for g in groups))
+            if len(plan) == min_k:
+                found.append(plan)
+            return
+        elem = remaining[0]
+        rest = remaining[1:]
+        for gi in range(len(groups)):
+            ng = groups[gi] | {elem}
+            if _feasible(by_id, ng, capacity):
+                gen(rest, groups[:gi] + [ng] + groups[gi + 1:])
+        if _feasible(by_id, {elem}, capacity):
+            gen(rest, groups + [{elem}])
+
+    gen(ids, [])
+    for plan in found:
+        cmp = compare_kiln_assignments(old_kiln_ids, list(plan))
+        stayed = len(cmp.stayed_item_ids)
+        pairs = tuple((nonempty_index[s - 1], t) for s, t in cmp.pairs)
+        key = (len(plan), -stayed, plan)
+        if best is None or key < best[0]:
+            best = (key, pairs)
+    return min_k, best[0][2], -best[0][1], best[1]
+
+
+def _wares_for(original_kilns):
+    return {w.item_id: w for kiln in original_kilns for w in kiln}
+
+
+def test_cancel_items_keeps_original_when_still_minimal():
+    # 取消 p4（独立高温窑）后 [p1][p2,p3] 仍为最少 2 窑，且全部留窑
+    original = [
+        [Ware("p1", 5, 100, 200)],
+        [Ware("p2", 6, 120, 220), Ware("p3", 4, 150, 300)],
+        [Ware("p4", 5, 1000, 1100)],
+    ]
+    r = cancel_items(original, ["p4"], 10)
+    assert [k.item_ids for k in r.kilns] == [("p1",), ("p2", "p3")]
+    assert r.pairs == ((1, 1), (2, 2))
+    assert r.stayed_item_ids == ("p1", "p2", "p3")
+    assert r.moved_item_ids == ()
+    assert r.canceled_item_ids == ("p4",)
+    assert r.kilns[0].firing_temp == 100
+    assert r.kilns[1].firing_temp == 150
+    assert r.kilns[1].total_volume == 10
+
+
+def test_cancel_items_compact_reduces_kilns():
+    # 三件各 6、容量 10 原 3 窑；取消一件后剩 2 件仍需 2 窑
+    original = [[Ware("1", 6, 100, 200)], [Ware("2", 6, 100, 200)], [Ware("3", 6, 100, 200)]]
+    r = cancel_items(original, ["2"], 10)
+    assert [k.item_ids for k in r.kilns] == [("1",), ("3",)]
+    assert r.stayed_item_ids == ("1", "3")
+    assert r.moved_item_ids == ()
+
+
+def test_cancel_items_stay_goal_beats_lex():
+    # 原方案（solve 生成，canonical）：[1] [2,3] [4,5]（各 5、容量 10）。
+    # 取消 1 后剩 2,3,4,5，最少 2 窑：
+    #   纯字典序最小 [2,3][4,5] 恰好也是留窑最优（4 件全留）。
+    original = [
+        [Ware("1", 5, 100, 200)],
+        [Ware("2", 5, 100, 200), Ware("3", 5, 100, 200)],
+        [Ware("4", 5, 100, 200), Ware("5", 5, 100, 200)],
+    ]
+    r = cancel_items(original, ["1"], 10)
+    assert [k.item_ids for k in r.kilns] == [("2", "3"), ("4", "5")]
+    assert r.stayed_item_ids == ("2", "3", "4", "5")
+    assert r.moved_item_ids == ()
+    assert r.pairs == ((2, 1), (3, 2))
+
+
+def test_cancel_items_moved_items():
+    # 原方案 [1] [2,3] [4,5]，取消 2：剩余 1,3,4,5 最少 2 窑。
+    # [1,3][4,5]：配对 (1,1)(3,2)，留窑 1、4、5（3 由旧窑 2 换入新窑 1）；
+    # [1][3,4][5] 是 3 窑，非最少。
+    original = [
+        [Ware("1", 5, 100, 200)],
+        [Ware("2", 5, 100, 200), Ware("3", 5, 100, 200)],
+        [Ware("4", 5, 100, 200), Ware("5", 5, 100, 200)],
+    ]
+    r = cancel_items(original, ["2"], 10)
+    assert [k.item_ids for k in r.kilns] == [("1", "3"), ("4", "5")]
+    assert r.pairs == ((1, 1), (3, 2))
+    assert r.stayed_item_ids == ("1", "4", "5")
+    assert r.moved_item_ids == ("3",)
+
+
+def test_cancel_items_empties_old_kiln():
+    # 取消整窑器物后该旧窑不参与配对
+    original = [
+        [Ware("a", 1, 100, 200)],
+        [Ware("b", 1, 1000, 1100)],
+    ]
+    r = cancel_items(original, ["b"], 10)
+    assert [k.item_ids for k in r.kilns] == [("a",)]
+    # 全部旧窑（含被清空者）参与配对比较；空窑无共同器物，配给任一新窑
+    assert r.pairs == ((1, 1),)
+    assert r.stayed_item_ids == ("a",)
+    assert r.moved_item_ids == ()
+
+
+def test_cancel_items_temperature_preserved():
+    # 取消后沿用剩余器物温区重排：烧成温度取各窑温区交集下界
+    original = [
+        [Ware("1", 1, 100, 120)],
+        [Ware("2", 1, 130, 140)],
+        [Ware("3", 1, 110, 130)],
+    ]
+    r = cancel_items(original, ["2"], 100)
+    # 1 与 3 温区相交 [110,120]，可合为 1 窑
+    assert [k.item_ids for k in r.kilns] == [("1", "3")]
+    assert r.kilns[0].firing_temp == 110
+    assert r.kilns[0].total_volume == 2
+    # 仅一个新窑，与旧窑 1 配对（配对序列字典序最小）：1 留窑，3 换窑
+    assert r.pairs == ((1, 1),)
+    assert r.stayed_item_ids == ("1",)
+    assert r.moved_item_ids == ("3",)
+
+
+def test_cancel_items_invalid():
+    original = [[Ware("a", 1, 100, 200)], [Ware("b", 1, 100, 200)]]
+    for bad in ([], ["x"], ["a", "a"], ["a", "b"]):
+        try:
+            cancel_items(original, bad, 10)
+            assert False, f"{bad} 应抛出 ValueError"
+        except ValueError:
+            pass
+
+
+def test_cancel_items_random_brute_force():
+    # 随机小规模用例：方案与最优配对同暴力枚举交叉验证
+    rng = random.Random(2026)
+    for trial in range(400):
+        n = rng.randint(1, 7)
+        items = []
+        for i in range(n):
+            vol = rng.randint(1, 6)
+            lo = rng.randint(900, 1000)
+            hi = lo + rng.randint(0, 100)
+            items.append(Ware(f"id{i}", vol, lo, hi))
+        capacity = rng.randint(max(it.volume for it in items), 15)
+        if any(it.volume > capacity for it in items):
+            continue
+        original = [
+            [next(it for it in items if it.item_id == i) for i in k.item_ids]
+            for k in solve(items, capacity)
+        ]
+        n_cancel = rng.randint(1, n - 1) if n > 1 else 0
+        if n_cancel == 0:
+            continue
+        all_ids = [it.item_id for it in items]
+        rng.shuffle(all_ids)
+        cancel_ids = all_ids[:n_cancel]
+
+        r = cancel_items(original, cancel_ids, capacity)
+        exp_k, exp_plan, exp_stayed, exp_pairs = _brute_force_cancel(
+            original, cancel_ids, capacity
+        )
+        got_plan = tuple(k.item_ids for k in r.kilns)
+        assert len(r.kilns) == exp_k
+        assert got_plan == exp_plan, (
+            f"trial {trial}: {got_plan} != {exp_plan}, "
+            f"items={items}, cap={capacity}, cancel={cancel_ids}"
+        )
+        assert len(r.stayed_item_ids) == exp_stayed, (
+            f"trial {trial}: stayed {r.stayed_item_ids} != {exp_stayed}"
+        )
+        assert r.pairs == exp_pairs
+        # 留窑 + 换窑 = 全部剩余器物，列表升序
+        kept = {it.item_id for it in items if it.item_id not in set(cancel_ids)}
+        assert set(r.stayed_item_ids) | set(r.moved_item_ids) == kept
+        assert not (set(r.stayed_item_ids) & set(r.moved_item_ids))
+        assert list(r.stayed_item_ids) == sorted(r.stayed_item_ids)
+        assert list(r.moved_item_ids) == sorted(r.moved_item_ids)
+        # 窑明细约束
+        wares = {w.item_id: w for w in items}
+        for k in r.kilns:
+            assert list(k.item_ids) == sorted(k.item_ids)
+            assert k.total_volume == sum(wares[i].volume for i in k.item_ids)
+            assert k.total_volume <= capacity
+            assert k.firing_temp == max(wares[i].temp_low for i in k.item_ids)
+            assert k.firing_temp <= min(wares[i].temp_high for i in k.item_ids)
+
+
+def test_cancel_items_performance_n13():
+    # 13 件单件成窑（取消 1 件 -> 12 窑，DP 状态最密集场景）
+    import time
+
+    original = [[Ware(f"i{i:02d}", 5, 1000, 1000)] for i in range(13)]
+    t0 = time.time()
+    r = cancel_items(original, ["i06"], 9)
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"13 件紧凑重排耗时 {elapsed:.2f}s"
+    assert len(r.kilns) == 12
+    assert len(r.stayed_item_ids) == 12
+
+    # 13 件两两 7 窑 -> 取消 1 件后 6 窑
+    original = [
+        [
+            Ware(f"i{2*j:02d}", 5, 1000, 1000),
+            Ware(f"i{2*j+1:02d}", 5, 1000, 1000),
+        ]
+        for j in range(6)
+    ] + [[Ware("i12", 5, 1000, 1000)]]
+    t0 = time.time()
+    r = cancel_items(original, ["i12"], 10)
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"7->6 窑紧凑重排耗时 {elapsed:.2f}s"
+    assert len(r.kilns) == 6
 
 
 if __name__ == "__main__":

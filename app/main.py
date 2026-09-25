@@ -6,6 +6,7 @@ GET  /plans/{plan_id}                    按 ID 读取已保存方案
 POST /plans/{plan_id}/capacity-target    求使最少窑次不超过目标的最小单窑容量
 POST /plans/{plan_id}/production-limit   限窑次接单：在最多 max_kilns 窑内择优保留器物
 POST /plans/{plan_id}/append-items       追加器物：填入原窑或追加窑次，另存为新方案
+POST /plans/{plan_id}/cancel-items       取消器物：紧凑重排，另存为新方案
 GET  /health                             健康检查
 """
 
@@ -20,6 +21,8 @@ from fastapi.responses import JSONResponse
 from . import database
 from .schemas import (
     AppendItemsIn,
+    CancelItemsIn,
+    CancelItemsOut,
     CapacityTargetIn,
     CapacityTargetOut,
     ErrorOut,
@@ -37,6 +40,7 @@ from .solver import (
     TargetUnreachableError,
     Ware,
     append_items,
+    cancel_items,
     compare_kiln_assignments,
     min_capacity_for_target,
     select_within_kiln_limit,
@@ -420,3 +424,105 @@ def append_plan_items(plan_id: str, payload: AppendItemsIn) -> PlanOut:
 
     database.save_plan(new_plan)
     return PlanOut(**new_plan)
+
+
+@app.post(
+    "/plans/{plan_id}/cancel-items",
+    response_model=CancelItemsOut,
+    status_code=201,
+    tags=["plans"],
+    responses={
+        400: {
+            "model": ErrorOut,
+            "description": "取消编号不属于原方案 / 取消全部器物",
+        },
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="取消器物：最少窑次紧凑重排，另存为新方案",
+)
+def cancel_plan_items(plan_id: str, payload: CancelItemsIn) -> CancelItemsOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    cancel_ids = payload.item_ids  # 已在 schema 中去空白、非空且不重复
+    original_ids = {it["item_id"] for it in plan["items"]}
+    unknown = sorted(set(cancel_ids) - original_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_ITEM_ID",
+                "message": f"取消编号不属于原方案: {', '.join(unknown)}",
+            },
+        )
+
+    if len(cancel_ids) >= plan["item_count"]:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "CANCEL_ALL_ITEMS",
+                "message": (
+                    f"不得取消全部器物: 原方案共 {plan['item_count']} 件，"
+                    f"本次取消 {len(cancel_ids)} 件，取消后至少保留一件"
+                ),
+            },
+        )
+
+    # 沿用原方案保存的单窑容量、器物温区与原窑归属；结果作为新方案保存，
+    # 原方案不改写。
+    by_id = {
+        it["item_id"]: Ware(
+            item_id=it["item_id"],
+            volume=it["volume"],
+            temp_low=it["temp_low"],
+            temp_high=it["temp_high"],
+        )
+        for it in plan["items"]
+    }
+    original_kilns = [
+        [by_id[i] for i in k["item_ids"]]
+        for k in sorted(plan["kilns"], key=lambda k: k["index"])
+    ]
+
+    result = cancel_items(original_kilns, cancel_ids, plan["capacity"])
+
+    canceled_set = set(result.canceled_item_ids)
+    kept_items = [it for it in plan["items"] if it["item_id"] not in canceled_set]
+    new_plan = {
+        "id": uuid.uuid4().hex,
+        "capacity": plan["capacity"],
+        "item_count": len(kept_items),
+        "kiln_count": len(result.kilns),
+        "items": kept_items,
+        "kilns": [
+            {
+                "index": idx,
+                "item_ids": list(k.item_ids),
+                "total_volume": k.total_volume,
+                "firing_temp": k.firing_temp,
+            }
+            for idx, k in enumerate(result.kilns, start=1)
+        ],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    database.save_plan(new_plan)
+
+    return CancelItemsOut(
+        source_plan_id=plan["id"],
+        new_plan_id=new_plan["id"],
+        canceled_item_ids=list(result.canceled_item_ids),
+        stayed_item_ids=list(result.stayed_item_ids),
+        moved_item_ids=list(result.moved_item_ids),
+        kiln_pairs=[
+            KilnPairOut(source_index=s, target_index=t) for s, t in result.pairs
+        ],
+        new_plan=PlanOut(**new_plan),
+    )

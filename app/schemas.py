@@ -75,6 +75,34 @@ class AppendItemsIn(BaseModel):
         return self
 
 
+class CancelItemsIn(BaseModel):
+    """取消器物请求。"""
+
+    item_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description="取消的器物编号（非空、不重复，均须属于原方案，且至少保留一件）",
+    )
+
+    @field_validator("item_ids")
+    @classmethod
+    def _nonblank_and_unique(cls, v: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        dup: list[str] = []
+        for raw in v:
+            item_id = raw.strip()
+            if not item_id:
+                raise ValueError("器物编号不得为空白字符串")
+            if item_id in seen and item_id not in dup:
+                dup.append(item_id)
+            seen.add(item_id)
+            cleaned.append(item_id)
+        if dup:
+            raise ValueError(f"取消器物编号不得重复，重复编号: {', '.join(dup)}")
+        return cleaned
+
+
 class ItemOut(ItemIn):
     pass
 
@@ -143,6 +171,27 @@ class ProductionLimitOut(BaseModel):
     delayed_item_ids: list[str] = Field(..., description="延期器物编号，按编号升序")
     kiln_count: int = Field(..., description="保留器物的实际窑次（最少窑次）")
     kilns: list[KilnOut] = Field(..., description="保留器物的实际装窑明细")
+
+
+class CancelItemsOut(BaseModel):
+    """取消器物紧凑重排结果：另存为新方案，原方案不改写。"""
+
+    source_plan_id: str = Field(..., description="原方案 ID")
+    new_plan_id: str = Field(..., description="重排后另存的新方案 ID")
+    canceled_item_ids: list[str] = Field(
+        ..., description="取消的器物编号，按编号升序"
+    )
+    stayed_item_ids: list[str] = Field(
+        ...,
+        description="新旧窑次最优配对后仍留在对应窑的器物编号，按编号升序",
+    )
+    moved_item_ids: list[str] = Field(
+        ..., description="换窑的器物编号（含未落在配对窑内者），按编号升序"
+    )
+    kiln_pairs: list[KilnPairOut] = Field(
+        ..., description="窑次配对（原窑次序号 → 新窑次序号），按原窑次序号升序"
+    )
+    new_plan: PlanOut = Field(..., description="重排后另存的新方案")
 
 
 class PlanCompareIn(BaseModel):

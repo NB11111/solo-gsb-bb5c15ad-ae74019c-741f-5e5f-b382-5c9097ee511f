@@ -30,10 +30,23 @@
 与温度区间交集均满足的原窑（同一原窑可填多件，按合并整体判定），或进入
 追加窑次。以后缀位掩码 DP 求新增窑次最少的全局方案，再按原窑次序贪心
 重建整体字典序最小者；剩余新器物的追加窑次复用 solve。
+
+取消器物（cancel_items）：从原方案删除指定器物后对剩余器物紧凑重排。
+第一目标为最少窑次（复用子集表与 dp）；并列时以「取消后仍非空的旧窑与
+新窑一对一最优配对（配对数取两边窑次数较小值，被清空的旧窑不参与配对）
+后仍留在对应窑的器物数」最多为次目标，配对并列沿用
+compare_kiln_assignments 的配对序列字典序规则；仍并列时取整体字典序
+最小方案。因删除器物不会破坏成窑可行性，新窑次必不多于非空旧窑数，
+故每个新窑都能与一个旧窑配对。算法按非空旧窑序做
+「覆盖器物掩码 × 已用窑次 × 窑数 × 留窑增益」的位掩码 DP，每个旧窑可
+跳过或与一个可行新窑配对，各增益档分别记录已建窑的最小规范排序键
+（向已排序窑列插入新窑对排序键保序），最后取最少窑次层中增益最大者；
+新旧窑配对并列时再调用 compare_kiln_assignments 取配对序列字典序最小者。
 """
 
 from __future__ import annotations
 
+from bisect import insort
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -85,6 +98,23 @@ class PlanComparison:
     moved_item_ids: tuple[str, ...]         # 换窑的共同器物（含未落在配对窑内者）
     only_in_source_item_ids: tuple[str, ...]
     only_in_target_item_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CancelResult:
+    """取消器物后的紧凑重排结果。
+
+    kilns 为新方案各窑（窑次序号从 1 开始，窑内编号升序）；
+    pairs 为取消后仍非空的（原窑次序号, 新窑次序号）最优配对，
+    按原窑次序号升序；被清空的旧窑不参与配对。
+    各编号列表均按标准字符串字典序升序。
+    """
+
+    canceled_item_ids: tuple[str, ...]
+    stayed_item_ids: tuple[str, ...]
+    moved_item_ids: tuple[str, ...]
+    pairs: tuple[tuple[int, int], ...]
+    kilns: tuple[Kiln, ...]
 
 
 @dataclass(frozen=True)
@@ -665,3 +695,216 @@ def append_items(
         )
 
     return kilns
+
+
+def cancel_items(
+    original_kilns: Sequence[Sequence[Ware]],
+    cancel_ids: Sequence[str],
+    capacity: int,
+) -> CancelResult:
+    """在已保存方案上取消器物，对剩余器物做紧凑重排。
+
+    取消器物只会从各窑中拿走成员（剩余器物温区不变、占用容量只减不增），
+    故取消后仍非空的旧窑仍是可行窑：重排后的最少窑次 k 不超过非空旧窑数 m，
+    每个新窑都能与一个（不同的）非空旧窑配对。被清空的旧窑无共同器物，
+    不参与配对。择优优先级：
+
+      1. 窑次数最少（对剩余器物复用子集表与最少窑次 dp）；
+      2. 窑次相同时，非空旧窑与新窑一对一最优配对（配对数 = k）后
+         仍留在对应窑的器物数最多；
+      3. 仍并列时，取窑内编号升序、窑次按编号序列排序后的整体
+         字典序最小方案。
+
+    算法按非空旧窑序做位掩码 DP：状态 (已处理旧窑, 覆盖器物掩码, 新窑数 q)
+    对每个留窑增益分别记录「已建窑的规范排序键」——不同增益互不可支配
+    （当前少 1 分可能靠后续旧窑补回），同增益下向已升序列插入新窑的
+    最终键随被插入键保序（插入位置只与键有关），故每档增益只保留最小
+    已建键即可；每个旧窑可跳过，或与一个由未覆盖器物构成的可行新窑配对
+    （留窑增益 = 该子集中原属此旧窑的器物数）。最终取最少窑次层中
+    增益最大者的键；新旧窑配对并列时再调用 compare_kiln_assignments
+    取配对序列字典序最小者。
+
+    :param original_kilns: 原方案各窑的器物（按原窑次序，序号从 1 开始）
+    :param cancel_ids: 取消的器物编号（非空、不重复，均须属于原方案，
+        且不得取消全部器物；校验由调用方完成，此处对非法参数抛 ValueError）
+    :param capacity: 单窑容量（沿用原方案）
+    """
+
+    canceled = frozenset(cancel_ids)
+    if not canceled:
+        raise ValueError("至少需要取消一件器物")
+    if len(canceled) != len(list(cancel_ids)):
+        raise ValueError("取消器物编号不得重复")
+
+    old_wares = [w for kiln in original_kilns for w in kiln]
+    by_id = {w.item_id: w for w in old_wares}
+    unknown = sorted(canceled - set(by_id))
+    if unknown:
+        raise ValueError(f"取消编号不属于原方案: {', '.join(unknown)}")
+
+    remaining = [w for w in old_wares if w.item_id not in canceled]
+    if not remaining:
+        raise ValueError("不得取消全部器物，取消后至少保留一件")
+
+    # 旧窑在取消后的剩余器物（按旧窑次序；旧窑内编号升序）
+    old_groups: list[tuple[str, ...]] = []
+    for kiln in original_kilns:
+        members = tuple(
+            sorted(w.item_id for w in kiln if w.item_id not in canceled)
+        )
+        if members:
+            old_groups.append(members)
+
+    # ---- 剩余器物的子集表：可成窑标记、体积、烧成温度与最少窑次 ----
+    tables = _build_tables(remaining, capacity)
+    n = tables.n
+    ids = tables.ids
+    valid = tables.valid
+    dp = tables.dp
+    mask_volume = tables.mask_volume
+    mask_temp_low = tables.mask_temp_low
+    size = 1 << n
+    full = size - 1
+    min_kilns = dp[full]
+
+    index_of = {item_id: i for i, item_id in enumerate(ids)}
+    old_masks = [
+        sum(1 << index_of[item_id] for item_id in members)
+        for members in old_groups
+    ]
+    m = len(old_groups)
+
+    def _members(group_mask: int) -> tuple[str, ...]:
+        return tuple(ids[i] for i in range(n) if (group_mask >> i) & 1)
+
+    # 各可行窑子集的成员元组（升序），仅算一次
+    members_of: dict[int, tuple[str, ...]] = {
+        mask: _members(mask) for mask in range(1, size) if valid[mask]
+    }
+
+    # DP（按「非空旧窑序」推进）：
+    #   layers[q][mask] = {gain: 该增益下已建窑的最小规范排序键}
+    # 含义：处理完若干个旧窑后，恰建 q 个新窑、覆盖器物集合 mask 时，
+    # 各留窑增益对应的最小已建键。
+    #
+    # 注意不能在同一 (q, mask) 上只保留增益最大者：某条路径当前少得 1 分，
+    # 可能是把高重合旧窑留待后续与更匹配的新窑配对而反超；不同增益互不可
+    # 支配，必须分别保留。同增益下由「向升序列插入保序」的引理，最小的已建
+    # 键一定给出最小的最终键，故每档增益只留一个键。
+    # 每个旧窑可跳过，或与一个由未覆盖器物构成的可行新窑配对
+    # （留窑增益 = 新窑中原属此旧窑的器物数）。
+    Key = tuple[tuple[str, ...], ...]
+    layers: list[list[dict[int, Key]]] = [[{} for _ in range(size)]]
+    layers[0][0] = {0: ()}
+
+    for oi in range(m):
+        own = old_masks[oi]
+        new_layers: list[list[dict[int, Key]]] = [
+            [dict(cell) for cell in qm] for qm in layers
+        ]
+        while len(new_layers) <= min_kilns:
+            new_layers.append([{} for _ in range(size)])
+        # 处理完前 oi+1 个旧窑至多建 oi+1 个新窑，且只需到最少窑次 k
+        for q in range(min(oi, min_kilns - 1) + 1):
+            cells = layers[q]
+            slots = min_kilns - q  # 含本窑配对后还需占用的窑次数上限
+            for mask, cell in enumerate(cells):
+                if not cell:
+                    continue
+                free = full ^ mask
+                # 先枚举可行新窑，再对各增益档展开（增益档数量通常很少）
+                groups: list[tuple[int, tuple[str, ...]]] = []
+                sub = free
+                while sub:
+                    # 新窑 sub 可行，且其覆盖后剩余器物仍能在 slots-1 窑内装完
+                    if valid[sub] and dp[free ^ sub] <= slots - 1:
+                        groups.append((sub, members_of[sub]))
+                    sub = (sub - 1) & free
+                if not groups:
+                    continue
+                target = new_layers[q + 1]
+                for gain_base, key_base in cell.items():
+                    for sub, members in groups:
+                        gain = gain_base + (sub & own).bit_count()
+                        inserted = list(key_base)
+                        insort(inserted, members)
+                        new_key: Key = tuple(inserted)
+                        tcell = target[mask | sub]
+                        old_key = tcell.get(gain)
+                        if old_key is None or new_key < old_key:
+                            tcell[gain] = new_key
+        # q 不会超过已处理旧窑数，也无需保留超过最少窑次的层
+        del new_layers[min_kilns + 1:]
+        layers = new_layers
+
+    # 取最少窑次层中的最大留窑增益，及其最小整体字典序键
+    final_cell = layers[min_kilns][full]
+    assert final_cell
+    best_gain = max(final_cell)
+    plan_key = final_cell[best_gain]
+
+    kilns = tuple(
+        Kiln(
+            item_ids=members,
+            total_volume=mask_volume[
+                sum(1 << index_of[item_id] for item_id in members)
+            ],
+            firing_temp=mask_temp_low[
+                sum(1 << index_of[item_id] for item_id in members)
+            ],
+        )
+        for members in plan_key
+    )
+
+    # 最优配对并列规则沿用方案对比：以取消后仍非空的旧窑为来源、
+    # 新窑为目标做最大权匹配（被清空的旧窑无共同器物，不参与配对），
+    # 配对序列字典序最小。
+    comparison = compare_kiln_assignments(
+        list(old_groups),
+        list(plan_key),
+    )
+
+    # 非空旧窑的原窑次序号（old_groups 依原窑次序过滤得到）
+    nonempty_old_index = [
+        idx
+        for idx, kiln in enumerate(original_kilns, start=1)
+        if any(w.item_id not in canceled for w in kiln)
+    ]
+    pair_map = {
+        nonempty_old_index[s - 1]: t for s, t in comparison.pairs
+    }
+    old_of: dict[str, int] = {}
+    for idx, kiln in enumerate(original_kilns, start=1):
+        for w in kiln:
+            if w.item_id not in canceled:
+                old_of[w.item_id] = idx
+    new_of: dict[str, int] = {}
+    for idx, members in enumerate(plan_key, start=1):
+        for item_id in members:
+            new_of[item_id] = idx
+    stayed = tuple(
+        sorted(
+            item_id
+            for item_id in new_of
+            if pair_map.get(old_of[item_id]) == new_of[item_id]
+        )
+    )
+    moved = tuple(
+        sorted(
+            item_id
+            for item_id in new_of
+            if pair_map.get(old_of[item_id]) != new_of[item_id]
+        )
+    )
+    pairs_out = tuple(
+        (nonempty_old_index[s - 1], t) for s, t in comparison.pairs
+    )
+    assert best_gain == len(stayed)
+
+    return CancelResult(
+        canceled_item_ids=tuple(sorted(canceled)),
+        stayed_item_ids=stayed,
+        moved_item_ids=moved,
+        pairs=pairs_out,
+        kilns=kilns,
+    )
